@@ -16,9 +16,10 @@ This is a fork of [taigrr/spank](https://github.com/taigrr/spank) with a redesig
 
 - **Intensity-graded responses** — no mode switching. Every slap is measured and one of three sounds plays automatically: light taps get the weak sound, harder hits escalate through medium up to strong.
 - **Menu bar app** (`spank.app`) — starts spank automatically on launch, one-click stop/start, lives in your menu bar.
-- **Lid-open greeting** — open the lid and spank greets you with the medium sound.
 - **Simple packaging** — build a distributable `.app` or `.dmg` with one script.
 - Playback volume follows the system output volume — no in-app volume control.
+- Adaptive noise floor: a 2-second startup calibration measures ambient vibration and auto-raises the threshold in noisy environments.
+- Echo filter: after each hit, detection stays silent until the chassis vibration settles, so one slap never fires twice.
 - 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`.
 - `--stdio` JSON protocol for GUI/automation integration, and `--debug` for live sensor diagnostics.
 
@@ -108,7 +109,7 @@ go build -o spank .
 1. Reads raw accelerometer data directly via IOKit HID (Apple SPU sensor)
 2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
 3. When a significant impact is detected, grades the amplitude and plays the matching embedded MP3
-4. Watches the power management log for lid-open wake events and plays the medium sound as a greeting
+4. An echo filter keeps detection silent while the chassis is still ringing from the previous hit
 5. Playback volume follows the system output volume — no in-app volume control
 6. 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`
 

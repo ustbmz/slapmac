@@ -243,6 +243,19 @@ final class Controller: NSObject, NSApplicationDelegate {
         guard !isRunning else { return }
         guard ensureInstalled() else { return }
 
+        // Clear orphaned spank instances (e.g. left behind by a previous
+        // GUI crash) so the new instance never fights over the accelerometer.
+        let cleanup = Process()
+        cleanup.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        cleanup.arguments = ["-n", installPath, "--quit-all"]
+        do {
+            try cleanup.run()
+            cleanup.waitUntilExit()
+        } catch {
+            // Non-fatal: the single-instance lock in spank will catch
+            // any conflict with a clear error message.
+        }
+
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         var args = ["-n", installPath, "--stdio"]

@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -55,6 +56,11 @@ var (
 	fastMode  bool
 	debugMode bool
 	stdioMode bool
+	quitAll   bool
+
+	// instanceLock holds the single-instance flock for the process
+	// lifetime; the OS releases it automatically on exit.
+	instanceLock *os.File
 
 	// Flag targets; the values are published into the atomic settings
 	// below before the run starts.
@@ -108,6 +114,26 @@ const (
 
 	// sensorStartupDelay gives the sensor time to start producing data.
 	sensorStartupDelay = 100 * time.Millisecond
+)
+
+// Adaptive noise floor parameters (inspired by obiwancannab1s/slapmac).
+// ambientJitter tracks the resting jerk level — the change in acceleration
+// magnitude between consecutive samples. The detection threshold becomes
+// max(minAmplitude, jitterFactor*ambientJitter), so a quiet room keeps the
+// floor at minAmplitude while a vibrating desk auto-raises it.
+const (
+	defaultAmbientJitter    = 0.004           // conservative seed until calibration finishes
+	jitterCalibrationWindow = 2 * time.Second // startup measurement window
+	jitterFactor            = 2.5             // threshold multiplier over measured jitter
+	jitterFloor             = 0.0015          // clamp so a dead-quiet room can't zero it
+	jitterCeiling           = 0.02            // clamp so a wild spike can't mute all slaps
+	ambientAlphaDown        = 0.05            // EMA rate when the room gets quieter
+	ambientAlphaUp          = 0.002           // EMA rate when the room gets noisier (slow: slaps must not inflate it)
+
+	// Impact sustain parameters. After a slap fires, the chassis keeps
+	// ringing; the detector re-arms only once the vibration has settled.
+	sustainReleaseTicks = 5                      // consecutive quiet ticks before re-arm
+	sustainMaxActive    = 700 * time.Millisecond // failsafe: force re-arm
 )
 
 type runtimeTuning struct {
@@ -184,9 +210,19 @@ harder hits escalate through medium up to strong:
   0.03g .. 0.05g         -> medium.mp3
   >= 0.05g               -> strong.mp3
 
+The detection threshold is adaptive: after a short startup calibration
+spank measures the ambient vibration level and raises the threshold
+above --min-amplitude automatically in noisy environments. A sustain
+filter also swallows echo events while the chassis is still ringing
+from the previous slap.
+
 Requires sudo (for IOKit HID access to the accelerometer).`,
 		Version: version,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if quitAll {
+				stopOtherInstances()
+				return nil
+			}
 			tuning := defaultTuning()
 			if fastMode {
 				tuning = applyFastOverlay(tuning)
@@ -215,6 +251,7 @@ Requires sudo (for IOKit HID access to the accelerometer).`,
 	cmd.Flags().Float64Var(&minAmplitudeFlag, "min-amplitude", defaultMinAmplitude, "Minimum amplitude threshold (0.0-1.0, lower = more sensitive)")
 	cmd.Flags().IntVar(&cooldownFlag, "cooldown", defaultCooldownMs, "Cooldown between responses in milliseconds")
 	cmd.Flags().BoolVar(&stdioMode, "stdio", false, "Enable stdio mode: JSON output and stdin commands (for GUI integration)")
+	cmd.Flags().BoolVar(&quitAll, "quit-all", false, "Terminate any other running spank instances, then exit (used by the menu bar app)")
 	cmd.Flags().Float64Var(&speedFlag, "speed", defaultSpeedRatio, "Playback speed multiplier (0.5 = half speed, 2.0 = double speed)")
 
 	if err := fang.Execute(context.Background(), cmd, fang.WithVersion(version)); err != nil {
@@ -225,6 +262,18 @@ Requires sudo (for IOKit HID access to the accelerometer).`,
 func run(ctx context.Context, tuning runtimeTuning) error {
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("spank requires root privileges for accelerometer access, run with: sudo spank")
+	}
+
+	// Single-instance guard: two spank processes would fight over the same
+	// accelerometer shared-memory ring and break detection. The flock is
+	// held for the process lifetime and released automatically on exit.
+	lock, err := os.OpenFile("/tmp/spank.lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err == nil {
+		if lockErr := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
+			lock.Close()
+			return fmt.Errorf("another spank instance is already running; stop it first (menu bar app -> 停止, or: sudo pkill -f '/usr/local/bin/spank')")
+		}
+		instanceLock = lock
 	}
 
 	if tuning.minAmplitude < 0 || tuning.minAmplitude > 1 {
@@ -287,19 +336,29 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 	var lastYell time.Time
 	var slapCount atomic.Uint64
 
+	// Adaptive noise floor (see jitter* constants). Seeded conservatively,
+	// then calibrated from real data during the first seconds of runtime.
+	var ambientJitter atomicFloat64
+	ambientJitter.Store(defaultAmbientJitter)
+	calibUntil := time.Now().Add(jitterCalibrationWindow)
+	calibDone := false
+	var calibJerks []float64
+
+	// Impact sustain state machine. While a slap is still ringing on the
+	// chassis, all new events are swallowed; the detector re-arms once the
+	// vibration falls back to ambient level for sustainReleaseTicks ticks.
+	impactActive := false
+	impactLowCounter := 0
+	var impactActiveSince time.Time
+
+	// Previous sample magnitude, for per-sample jerk computation.
+	var prevMag float64
+	havePrevMag := false
+
 	// Start stdin command reader if in JSON mode
 	if stdioMode {
 		go readStdinCommands()
 	}
-
-	// Greet on lid open: watch the power management log for "LidOpen" wake
-	// events — the signature written when the lid is opened from sleep. While
-	// the lid is shut the Mac usually sleeps; on wake the poll resumes and sees
-	// the new entry, so the greeting fires shortly after the lid opens.
-	go watchLidOpen(ctx, func() {
-		fmt.Println("spank: lid opened")
-		go playAudio(painDir+"/medium.mp3", &speakerInit)
-	})
 
 	presetLabel := "default"
 	if fastMode {
@@ -337,11 +396,67 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 			samples = samples[len(samples)-tuning.maxBatch:]
 		}
 
+		// Per-sample processing: feed the detector and compute jerk
+		// (per-sample change in magnitude) plus deviation from rest (1g).
+		batchMaxJerk := 0.0
+		batchMaxDev := 0.0
 		nSamples := len(samples)
 		for idx, sample := range samples {
 			tSample := tNow - float64(nSamples-idx-1)/float64(det.FS)
 			det.Process(sample.X, sample.Y, sample.Z, tSample)
+
+			mag := math.Sqrt(sample.X*sample.X + sample.Y*sample.Y + sample.Z*sample.Z)
+			if havePrevMag {
+				jerk := math.Abs(mag - prevMag)
+				if jerk > batchMaxJerk {
+					batchMaxJerk = jerk
+				}
+				if now.Before(calibUntil) {
+					calibJerks = append(calibJerks, jerk)
+				}
+			}
+			prevMag = mag
+			havePrevMag = true
+			if dev := math.Abs(mag - 1.0); dev > batchMaxDev {
+				batchMaxDev = dev
+			}
 		}
+
+		// Finish calibration on the first tick past the window.
+		if !calibDone && !now.Before(calibUntil) {
+			calibDone = true
+			if n := len(calibJerks); n > 20 {
+				sort.Float64s(calibJerks)
+				p95 := calibJerks[(n*95)/100]
+				if p95 < jitterFloor {
+					p95 = jitterFloor
+				}
+				if p95 > jitterCeiling {
+					p95 = jitterCeiling
+				}
+				ambientJitter.Store(p95)
+				eff := math.Max(minAmplitude.Load(), jitterFactor*p95)
+				fmt.Printf("spank: adaptive noise floor calibrated: jitter %.4fg -> threshold %.3fg\n", p95, eff)
+			}
+		} else if calibDone && nSamples > 0 && !impactActive {
+			// Slowly follow the environment: drop fast when quieter,
+			// rise very slowly so slap echoes never inflate the floor.
+			cur := ambientJitter.Load()
+			alpha := ambientAlphaDown
+			if batchMaxJerk > cur {
+				alpha = ambientAlphaUp
+			}
+			next := cur + alpha*(batchMaxJerk-cur)
+			if next < jitterFloor {
+				next = jitterFloor
+			}
+			if next > jitterCeiling {
+				next = jitterCeiling
+			}
+			ambientJitter.Store(next)
+		}
+
+		effectiveThreshold := math.Max(minAmplitude.Load(), jitterFactor*ambientJitter.Load())
 
 		// Debug mode: print live sensor stats once per second so users can
 		// tell whether data flows at all and how large their taps register
@@ -354,8 +469,8 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 			dbgEvents = len(det.Events)
 			if now.Sub(lastDbgPrint) >= time.Second {
 				lastDbgPrint = now
-				fmt.Printf("debug: samples/s=%d latestMag=%.5fg maxMag=%.5fg rms=%.5f peak=%.5f events=%d threshold=%.3f\n",
-					dbgSamples, det.LatestMag, dbgMaxMag, det.RMS, det.Peak, dbgEvents, minAmplitude.Load())
+				fmt.Printf("debug: samples/s=%d latestMag=%.5fg maxMag=%.5fg rms=%.5f peak=%.5f events=%d threshold=%.3f (min=%.3f jitter=%.4f)\n",
+					dbgSamples, det.LatestMag, dbgMaxMag, det.RMS, det.Peak, dbgEvents, effectiveThreshold, minAmplitude.Load(), ambientJitter.Load())
 				dbgSamples = 0
 				dbgMaxMag = 0
 			}
@@ -371,18 +486,39 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 		}
 		lastEventTime = ev.Time
 
+		// Impact sustain: swallow events while the previous slap is still
+		// ringing; re-arm once the vibration settles back to ambient.
+		if impactActive {
+			if nSamples > 0 {
+				release := math.Max(0.02, 3*ambientJitter.Load())
+				if batchMaxDev < release {
+					impactLowCounter++
+				} else {
+					impactLowCounter = 0
+				}
+			}
+			if impactLowCounter >= sustainReleaseTicks || now.Sub(impactActiveSince) >= sustainMaxActive {
+				impactActive = false
+				impactLowCounter = 0
+			}
+			continue
+		}
+
 		// Read live settings each event so stdin "set" takes effect
 		// immediately and the fast-preset tuning snapshot is honoured.
 		cooldown := time.Duration(cooldownMs.Load()) * time.Millisecond
 		if time.Since(lastYell) <= cooldown {
 			continue
 		}
-		if ev.Amplitude < minAmplitude.Load() {
+		if ev.Amplitude < effectiveThreshold {
 			continue
 		}
 
 		lastYell = now
 		num := slapCount.Add(1)
+		impactActive = true
+		impactLowCounter = 0
+		impactActiveSince = now
 		file := fileForAmplitude(ev.Amplitude)
 		if stdioMode {
 			event := map[string]interface{}{
@@ -432,45 +568,29 @@ func resampleForPlayback(source beep.Streamer, fileRate, speakerRate beep.Sample
 	return beep.Resample(4, srcRate, speakerRate, source)
 }
 
-// watchLidOpen invokes onOpen whenever the laptop lid is opened. It polls
-// `pmset -g log` (readable without special privileges) for new wake entries
-// whose signature contains "LidOpen". lastStamp starts at "now" so historical
-// entries never fire; only entries newer than startup count.
-func watchLidOpen(ctx context.Context, onOpen func()) {
-	const stampLen = len("2006-01-02 15:04:05")
-	lastStamp := time.Now().Format("2006-01-02 15:04:05")
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(2 * time.Second):
-		}
-		out, err := exec.Command("pmset", "-g", "log").Output()
-		if err != nil {
+// stopOtherInstances terminates every other running spank process. The
+// menu bar app invokes `spank --quit-all` (through its passwordless
+// sudoers entry) before starting a fresh instance, so orphaned spank
+// processes left behind by a crashed GUI can never fight the new
+// instance over the accelerometer. Only matches the installed binary
+// path, which never matches the spankbar GUI itself.
+func stopOtherInstances() {
+	out, err := exec.Command("pgrep", "-f", "/usr/local/bin/spank").Output()
+	if err != nil {
+		return // no matches (or pgrep unavailable); nothing to do
+	}
+	self := os.Getpid()
+	for _, field := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid == self {
 			continue
 		}
-		maxSeen := lastStamp
-		for _, line := range strings.Split(string(out), "\n") {
-			if len(line) < stampLen {
-				continue
-			}
-			stamp := line[:stampLen]
-			if stamp > maxSeen {
-				maxSeen = stamp
-			}
-			if stamp <= lastStamp {
-				continue
-			}
-			// Match the exact wake signature "LidOpen" (e.g. "due to
-			// EC.LidOpen(E)"). A bare "lid" substring would also match
-			// common words like "valid"/"invalid" in unrelated pmset
-			// lines and fire phantom greetings.
-			if strings.Contains(line, "Wake") && strings.Contains(strings.ToLower(line), "lidopen") {
-				onOpen()
-			}
-		}
-		lastStamp = maxSeen
+		fmt.Printf("spank: stopping leftover instance pid %d\n", pid)
+		syscall.Kill(pid, syscall.SIGTERM)
 	}
+	// Give the dying processes a moment to release the accelerometer
+	// and the single-instance lock before the caller starts a new one.
+	time.Sleep(500 * time.Millisecond)
 }
 
 func playAudio(path string, speakerInit *bool) {
