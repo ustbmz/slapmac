@@ -3,20 +3,16 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"math"
 	"strings"
 	"testing"
 )
 
 // resetGlobals resets global state before each test
 func resetGlobals() {
-	pausedMu.Lock()
-	paused = false
-	pausedMu.Unlock()
-	minAmplitude = 0.05
-	cooldownMs = 750
+	paused.Store(false)
+	minAmplitude.Store(0.05)
+	cooldownMs.Store(750)
 	stdioMode = true
-	volumeScaling = false
 }
 
 func TestPauseCommand(t *testing.T) {
@@ -28,11 +24,9 @@ func TestPauseCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	// Check state changed
-	pausedMu.RLock()
-	if !paused {
+	if !paused.Load() {
 		t.Error("expected paused to be true after pause command")
 	}
-	pausedMu.RUnlock()
 
 	// Check output
 	var resp map[string]string
@@ -48,9 +42,7 @@ func TestResumeCommand(t *testing.T) {
 	resetGlobals()
 
 	// First pause
-	pausedMu.Lock()
-	paused = true
-	pausedMu.Unlock()
+	paused.Store(true)
 
 	input := `{"cmd":"resume"}` + "\n"
 	var output bytes.Buffer
@@ -58,11 +50,9 @@ func TestResumeCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	// Check state changed
-	pausedMu.RLock()
-	if paused {
+	if paused.Load() {
 		t.Error("expected paused to be false after resume command")
 	}
-	pausedMu.RUnlock()
 
 	// Check output
 	var resp map[string]string
@@ -83,8 +73,8 @@ func TestSetAmplitudeCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	// Check state changed
-	if minAmplitude != 0.15 {
-		t.Errorf("expected minAmplitude 0.15, got %f", minAmplitude)
+	if got := minAmplitude.Load(); got != 0.15 {
+		t.Errorf("expected minAmplitude 0.15, got %f", got)
 	}
 
 	// Check output
@@ -113,8 +103,8 @@ func TestSetCooldownCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	// Check state changed
-	if cooldownMs != 500 {
-		t.Errorf("expected cooldownMs 500, got %d", cooldownMs)
+	if got := cooldownMs.Load(); got != 500 {
+		t.Errorf("expected cooldownMs 500, got %d", got)
 	}
 
 	// Check output
@@ -138,25 +128,25 @@ func TestSetBothCommand(t *testing.T) {
 
 	processCommands(strings.NewReader(input), &output)
 
-	if minAmplitude != 0.2 {
-		t.Errorf("expected minAmplitude 0.2, got %f", minAmplitude)
+	if got := minAmplitude.Load(); got != 0.2 {
+		t.Errorf("expected minAmplitude 0.2, got %f", got)
 	}
-	if cooldownMs != 1000 {
-		t.Errorf("expected cooldownMs 1000, got %d", cooldownMs)
+	if got := cooldownMs.Load(); got != 1000 {
+		t.Errorf("expected cooldownMs 1000, got %d", got)
 	}
 }
 
 func TestSetAmplitudeOutOfRange(t *testing.T) {
 	resetGlobals()
-	originalAmplitude := minAmplitude
+	originalAmplitude := minAmplitude.Load()
 
 	// Test amplitude > 1 (should be ignored)
 	input := `{"cmd":"set","amplitude":1.5}` + "\n"
 	var output bytes.Buffer
 	processCommands(strings.NewReader(input), &output)
 
-	if minAmplitude != originalAmplitude {
-		t.Errorf("amplitude should not change for value > 1, got %f", minAmplitude)
+	if got := minAmplitude.Load(); got != originalAmplitude {
+		t.Errorf("amplitude should not change for value > 1, got %f", got)
 	}
 
 	// Test amplitude <= 0 (should be ignored)
@@ -165,8 +155,8 @@ func TestSetAmplitudeOutOfRange(t *testing.T) {
 	output.Reset()
 	processCommands(strings.NewReader(input), &output)
 
-	if minAmplitude != originalAmplitude {
-		t.Errorf("amplitude should not change for value <= 0, got %f", minAmplitude)
+	if got := minAmplitude.Load(); got != originalAmplitude {
+		t.Errorf("amplitude should not change for value <= 0, got %f", got)
 	}
 
 	// Test negative amplitude
@@ -175,50 +165,15 @@ func TestSetAmplitudeOutOfRange(t *testing.T) {
 	output.Reset()
 	processCommands(strings.NewReader(input), &output)
 
-	if minAmplitude != originalAmplitude {
-		t.Errorf("amplitude should not change for negative value, got %f", minAmplitude)
-	}
-}
-
-func TestVolumeScalingCommand(t *testing.T) {
-	resetGlobals()
-
-	// Toggle on
-	input := `{"cmd":"volume-scaling"}` + "\n"
-	var output bytes.Buffer
-	processCommands(strings.NewReader(input), &output)
-
-	if !volumeScaling {
-		t.Error("expected volumeScaling to be true after toggle")
-	}
-
-	var resp struct {
-		Status        string `json:"status"`
-		VolumeScaling bool   `json:"volume_scaling"`
-	}
-	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to parse response: %v", err)
-	}
-	if resp.Status != "volume_scaling_toggled" {
-		t.Errorf("expected status 'volume_scaling_toggled', got %q", resp.Status)
-	}
-	if !resp.VolumeScaling {
-		t.Error("expected volume_scaling true in response")
-	}
-
-	// Toggle off
-	output.Reset()
-	processCommands(strings.NewReader(input), &output)
-
-	if volumeScaling {
-		t.Error("expected volumeScaling to be false after second toggle")
+	if got := minAmplitude.Load(); got != originalAmplitude {
+		t.Errorf("amplitude should not change for negative value, got %f", got)
 	}
 }
 
 func TestStatusCommand(t *testing.T) {
 	resetGlobals()
-	minAmplitude = 0.1
-	cooldownMs = 600
+	minAmplitude.Store(0.1)
+	cooldownMs.Store(600)
 
 	input := `{"cmd":"status"}` + "\n"
 	var output bytes.Buffer
@@ -226,11 +181,10 @@ func TestStatusCommand(t *testing.T) {
 	processCommands(strings.NewReader(input), &output)
 
 	var resp struct {
-		Status        string  `json:"status"`
-		Paused        bool    `json:"paused"`
-		Amplitude     float64 `json:"amplitude"`
-		Cooldown      int     `json:"cooldown"`
-		VolumeScaling bool    `json:"volume_scaling"`
+		Status    string  `json:"status"`
+		Paused    bool    `json:"paused"`
+		Amplitude float64 `json:"amplitude"`
+		Cooldown  int     `json:"cooldown"`
 	}
 	if err := json.Unmarshal(output.Bytes(), &resp); err != nil {
 		t.Fatalf("failed to parse response: %v", err)
@@ -247,16 +201,11 @@ func TestStatusCommand(t *testing.T) {
 	if resp.Cooldown != 600 {
 		t.Errorf("expected cooldown 600, got %d", resp.Cooldown)
 	}
-	if resp.VolumeScaling != false {
-		t.Errorf("expected volume_scaling false, got %t", resp.VolumeScaling)
-	}
 }
 
 func TestStatusCommandWhenPaused(t *testing.T) {
 	resetGlobals()
-	pausedMu.Lock()
-	paused = true
-	pausedMu.Unlock()
+	paused.Store(true)
 
 	input := `{"cmd":"status"}` + "\n"
 	var output bytes.Buffer
@@ -379,51 +328,6 @@ func TestMultipleCommands(t *testing.T) {
 	}
 }
 
-func TestAmplitudeToVolume(t *testing.T) {
-	tests := []struct {
-		name      string
-		amplitude float64
-		wantMin   float64
-		wantMax   float64
-	}{
-		{"below minimum returns min volume", 0.01, -3.0, -3.0},
-		{"at minimum returns min volume", 0.05, -3.0, -3.0},
-		{"above maximum returns max volume", 1.0, 0.0, 0.0},
-		{"at maximum returns max volume", 0.80, 0.0, 0.0},
-		{"mid amplitude returns mid-range", 0.40, -2.0, -0.5},
-		{"low amplitude is quieter than high", 0.10, -3.0, -1.5},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := amplitudeToVolume(tt.amplitude)
-			if got < tt.wantMin || got > tt.wantMax {
-				t.Errorf("amplitudeToVolume(%f) = %f, want in [%f, %f]",
-					tt.amplitude, got, tt.wantMin, tt.wantMax)
-			}
-		})
-	}
-
-	// Monotonicity: higher amplitude should yield higher (or equal) volume
-	prev := amplitudeToVolume(0.05)
-	for amp := 0.10; amp <= 0.80; amp += 0.05 {
-		cur := amplitudeToVolume(amp)
-		if cur < prev-1e-9 {
-			t.Errorf("non-monotonic: amplitudeToVolume(%f)=%f < amplitudeToVolume(prev)=%f",
-				amp, cur, prev)
-		}
-		prev = cur
-	}
-
-	// Verify no NaN or Inf
-	for _, amp := range []float64{0, 0.05, 0.1, 0.5, 0.8, 1.0, 10.0} {
-		v := amplitudeToVolume(amp)
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			t.Errorf("amplitudeToVolume(%f) returned %f", amp, v)
-		}
-	}
-}
-
 func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 	resetGlobals()
 	stdioMode = false
@@ -442,13 +346,11 @@ func TestNoOutputWhenStdioModeDisabled(t *testing.T) {
 	}
 
 	// But state should still change
-	pausedMu.RLock()
-	if !paused {
+	if !paused.Load() {
 		t.Error("expected paused to be true even with stdioMode=false")
 	}
-	pausedMu.RUnlock()
 
-	if minAmplitude != 0.5 {
-		t.Errorf("expected minAmplitude 0.5, got %f", minAmplitude)
+	if got := minAmplitude.Load(); got != 0.5 {
+		t.Errorf("expected minAmplitude 0.5, got %f", got)
 	}
 }

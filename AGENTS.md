@@ -4,7 +4,7 @@
 
 ## Project Overview
 
-**spank** is a macOS CLI tool that detects physical hits/slaps on Apple Silicon MacBooks via the accelerometer and plays audio responses. Single-file Go application with embedded MP3 assets.
+**spank** is a macOS CLI tool that detects physical hits/slaps on Apple Silicon MacBooks via the accelerometer and plays intensity-graded audio responses. Single-file Go application with embedded MP3 assets.
 
 - **Platform**: macOS on Apple Silicon (M2+) only
 - **Runtime requirement**: `sudo` (for IOKit HID accelerometer access)
@@ -20,10 +20,14 @@ go build -o spank .
 
 # Run (requires sudo)
 sudo ./spank
-sudo ./spank --sexy      # escalating responses mode
-sudo ./spank --halo      # Halo death sounds mode
-sudo ./spank --custom /path/to/mp3s  # custom audio directory
+
+# Diagnose detection (live sensor stats)
+sudo ./spank --debug
 ```
+
+> Note: this fork adds `menubar/` (Swift menu bar GUI) and `scripts/build-dmg.sh` /
+> `menubar/build-app.sh` / `menubar/build-dmg-gui.sh` packaging scripts. Use
+> `GOPROXY=https://goproxy.cn,direct` if the default Go proxy is unreachable.
 
 ### Install
 
@@ -46,9 +50,10 @@ git push origin v1.0.0
 spank/
 ├── main.go              # All application code (single file)
 ├── audio/
-│   ├── pain/            # Default "ow!" responses (10 MP3s)
-│   ├── sexy/            # Escalating responses (60 MP3s)
-│   └── halo/            # Halo death sounds (9 MP3s)
+│   └── pain/            # 4 intensity-graded responses:
+│                        #   weak / medium / strong / brutal (MP3)
+├── menubar/             # Swift menu bar GUI (spankbar) + build scripts
+├── scripts/             # CLI DMG packaging
 ├── go.mod
 ├── .goreleaser.yaml     # Release configuration
 └── .github/workflows/   # CI/CD
@@ -61,7 +66,7 @@ spank/
 | `github.com/taigrr/apple-silicon-accelerometer` | Reads accelerometer via IOKit HID |
 | `github.com/gopxl/beep/v2` | Audio playback (MP3 decoding, speaker output) |
 | `github.com/spf13/cobra` | CLI framework |
-| `github.com/charmbracelet/fang` | CLI config/execution wrapper |
+| `github.com/charmbracelet/fang` | CLI config/execution wrapper (version must be passed via `fang.WithVersion`) |
 
 ## Code Patterns
 
@@ -74,11 +79,25 @@ Audio files are embedded at compile time using `//go:embed`:
 var painAudio embed.FS
 ```
 
-### Play Modes
+### Intensity-graded selection
 
-Two playback strategies in `playMode`:
-- `modeRandom`: Random file selection (pain, halo, custom modes)
-- `modeEscalation`: Intensity increases with slap frequency (sexy mode)
+There are no user-selectable modes. `fileForAmplitude(amplitude)` maps the
+detected amplitude of each individual slap to one of the four graded sounds:
+
+| amplitude   | file          |
+|-------------|---------------|
+| < 0.15g     | `weak.mp3`    |
+| 0.15–0.35g  | `medium.mp3`  |
+| 0.35–0.60g  | `strong.mp3`  |
+| ≥ 0.60g     | `brutal.mp3`  |
+
+Thresholds are the `thresholdMedium/Strong/Brutal` constants in `main.go`.
+
+### Runtime settings
+
+`minAmplitude`, `cooldownMs`, `speedRatio` and `paused` are `sync/atomic`
+values shared between the detection loop and the stdin command handler —
+never replace them with plain globals.
 
 ### Slap Detection Flow
 
@@ -90,8 +109,8 @@ Two playback strategies in `playMode`:
 ### Concurrency
 
 - `speakerMu sync.Mutex` protects speaker initialization
-- `slapTracker.mu sync.Mutex` protects slap scoring state
 - Audio playback runs in goroutines (`go playAudio(...)`)
+- `slapCount atomic.Uint64` counts slaps
 
 ## Constants
 
@@ -99,34 +118,27 @@ Key tuning parameters in `main.go`:
 
 | Constant | Value | Purpose |
 |----------|-------|---------|
-| `decayHalfLife` | 30s | How fast escalation fades |
-| `slapCooldown` | 750ms | Minimum time between audio plays |
-| `sensorPollInterval` | 10ms | Accelerometer polling rate |
-| `maxSampleBatch` | 200 | Max samples processed per tick |
+| `defaultCooldownMs` | 750ms | Minimum time between audio plays |
+| `defaultSensorPollInterval` | 10ms | Accelerometer polling rate |
+| `defaultMaxSampleBatch` | 200 | Max samples processed per tick |
+| `thresholdMedium/Strong/Brutal` | 0.15/0.35/0.60 g | Intensity grading |
 
 ## Gotchas
 
 1. **Root required**: The app must run with `sudo` for IOKit HID access. The `run()` function checks `os.Geteuid() != 0`.
-
 2. **Apple Silicon only**: Only builds for `darwin/arm64`. Intel Macs are not supported.
-
 3. **Private dependency**: `github.com/taigrr/apple-silicon-accelerometer` requires `GOPRIVATE` setting and GitHub PAT for CI.
-
-4. **Single file**: All code is in `main.go`. When adding features, follow the existing pattern of types and functions in the same file.
-
-5. **Mutually exclusive modes**: `--sexy`, `--halo`, and `--custom` flags cannot be combined.
-
-6. **CGO disabled**: Builds use `CGO_ENABLED=0` despite targeting macOS.
+4. **Single file**: All Go code is in `main.go`. When adding features, follow the existing pattern of types and functions in the same file.
+5. **CGO disabled**: Builds use `CGO_ENABLED=0` despite targeting macOS.
+6. **stdin `quit` command**: spank runs as root so a non-root GUI cannot kill it; the stdio `quit` command self-delivers SIGINT. Keep it when refactoring `processCommands`.
 
 ## Adding Audio
 
-To add a new sound pack:
+To change the graded sounds:
 
-1. Create directory under `audio/`
-2. Add MP3 files (numbered for escalation mode, any names for random)
-3. Add `//go:embed audio/newpack/*.mp3` variable
-4. Add flag and case in `run()` switch statement
-5. Create `soundPack` with appropriate `playMode`
+1. Replace MP3s in `audio/pain/` (keep the `weak/medium/strong/brutal` names,
+   or update `fileForAmplitude` accordingly)
+2. Rebuild — files are embedded at compile time
 
 ## Version
 
@@ -136,4 +148,4 @@ Version is injected via ldflags at build time:
 var version = "dev"
 ```
 
-GoReleaser sets `-X main.version={{.Version}}` during release builds.
+GoReleaser and the local packaging scripts set `-X main.version={{.Version}}` during builds.

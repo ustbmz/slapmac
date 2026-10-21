@@ -1,66 +1,64 @@
 <p align="center">
-  <img src="doc/logo.png" alt="spank logo" width="200">
+  <img src="doc/logo.png" alt="slapmac logo" width="200">
 </p>
 
-# spank
+# slapmac
 
 **English** | [简体中文][readme-zh-link]
 
-Slap your MacBook, it yells back.
+Slap your MacBook, it yells back — hit harder, hear something worse.
 
-> "this is the most amazing thing i've ever seen" — [@kenwheeler](https://x.com/kenwheeler)
+Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses graded by intensity. Single binary, no dependencies.
 
-> "I just ran sexy mode with my wife sitting next to me...We died laughing" — [@duncanthedev](https://x.com/duncanthedev)
+This is a fork of [taigrr/spank](https://github.com/taigrr/spank) with a redesigned response system and a macOS menu bar app.
 
-> "peak engineering" — [@tylertaewook](https://x.com/tylertaewook)
+## Features
 
-Uses the Apple Silicon accelerometer (Bosch BMI286 IMU via IOKit HID) to detect physical hits on your laptop and plays audio responses. Single binary, no dependencies.
+- **Intensity-graded responses** — no mode switching. Every slap is measured and one of three sounds plays automatically: light taps get the weak sound, harder hits escalate through medium up to strong.
+- **Menu bar app** (`spank.app`) — starts spank automatically on launch, one-click stop/start, lives in your menu bar.
+- **Simple packaging** — build a distributable `.app` or `.dmg` with one script.
+- Playback volume follows the system output volume — no in-app volume control.
+- 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`.
+- `--stdio` JSON protocol for GUI/automation integration, and `--debug` for live sensor diagnostics.
 
 ## Requirements
 
 - macOS on Apple Silicon (any M-series chip M2 or greater, or the M1 Pro SKU specifically, no other M1/A-series chips!)
 - `sudo` (for IOKit HID accelerometer access)
-- Go 1.26+ (if building from source)
+- Go 1.26+ and Swift compiler (if building from source)
 
 ## Install
 
-Download from the [latest release](https://github.com/taigrr/spank/releases/latest).
+### Option A: DMG
 
-Or build from source:
+Build the GUI installer yourself:
 
 ```bash
-go install github.com/taigrr/spank@latest
+./menubar/build-dmg-gui.sh 1.0.0
+# -> dist/spankbar_1.0.0_mac_arm64.dmg
 ```
 
-> **Note:** `go install` places the binary in `$GOBIN` (if set) or `$(go env GOPATH)/bin` (which defaults to `~/go/bin`). Copy it to a system path so `sudo spank` works. For example, with the default Go settings:
->
-> ```bash
-> sudo cp "$(go env GOPATH)/bin/spank" /usr/local/bin/spank
-> ```
+Mount the DMG, drag `spank.app` into `Applications`, open it — spank starts automatically. On first launch the app asks once for admin rights to install the binary to `/usr/local/bin` and write a scoped sudoers entry; after that it starts silently.
+
+> **Note:** The app is ad-hoc signed. If Gatekeeper blocks it, run `xattr -cr /Applications/spank.app` once.
+
+### Option B: CLI only
+
+```bash
+go build -o spank .
+sudo cp spank /usr/local/bin/spank
+sudo spank
+```
 
 ## Usage
 
 ```bash
-# Normal mode — says "ow!" when slapped
-sudo spank
+sudo spank            # graded responses by slap intensity
+sudo spank --fast     # faster polling and shorter cooldown
+sudo spank --debug    # live sensor stats (samples/s, maxMag, events)
 
-# Sexy mode — escalating responses based on slap frequency
-sudo spank --sexy
-
-# Halo mode — plays Halo death sounds when slapped
-sudo spank --halo
-
-# Fast mode — faster polling and shorter cooldown
-sudo spank --fast
-sudo spank --sexy --fast
-
-# Custom mode — plays your own MP3 files from a directory
-sudo spank --custom /path/to/mp3s
-
-# Adjust sensitivity with amplitude threshold (lower = more sensitive)
-sudo spank --min-amplitude 0.1   # more sensitive
-sudo spank --min-amplitude 0.25  # less sensitive
-sudo spank --sexy --min-amplitude 0.2
+# Adjust sensitivity (default: 0.02)
+sudo spank --min-amplitude 0.05   # ignore very light taps
 
 # Set cooldown period in millisecond (default: 750)
 sudo spank --cooldown 600
@@ -68,166 +66,54 @@ sudo spank --cooldown 600
 # Set playback speed multiplier (default: 1.0)
 sudo spank --speed 0.7   # slower and deeper
 sudo spank --speed 1.5   # faster
-sudo spank --sexy --speed 0.6
 ```
 
-### Modes
+### Intensity-graded responses
 
-**Pain mode** (default): Randomly plays from 10 pain/protest audio clips when a slap is detected.
+No mode switching — the response is chosen automatically by the force of
+each individual slap. Thresholds are calibrated against live M2 sensor data
+(ordinary taps register 0.02–0.06g event amplitude, hard slaps reach 0.10g+):
 
-**Sexy mode** (`--sexy`): Tracks slaps within a rolling 5-minute window. The more you slap, the more intense the audio response. 60 levels of escalation.
+| Slap amplitude | Response     |
+| -------------- | ------------ |
+| < 0.03g        | `weak.mp3`   |
+| 0.03g – 0.05g  | `medium.mp3` |
+| ≥ 0.05g        | `strong.mp3` |
 
-**Halo mode** (`--halo`): Randomly plays from death sound effects from the Halo video game series when a slap is detected.
-
-**Custom mode** (`--custom`): Randomly plays MP3 files from a custom directory you specify.
+Swap `audio/pain/*.mp3` for your own sounds and rebuild — the filenames are the contract.
 
 ### Detection tuning
 
-Use `--fast` for a more responsive profile with faster polling (4ms vs 10ms), shorter cooldown (350ms vs 750ms), higher sensitivity (0.18 vs 0.05 threshold), and larger sample batch (320 vs 200).
+Use `--fast` for a more responsive profile with faster polling (4ms vs 10ms), shorter cooldown (350ms vs 750ms), and a larger sample batch.
 
-You can still override individual values with `--min-amplitude` and `--cooldown` when needed.
+`--debug` prints one line per second: sample rate, latest/max magnitude, RMS/peak, event count and the current threshold. Use it to find where your slaps land and tune the grade constants in `main.go`.
 
-### Sensitivity
-
-Control detection sensitivity with `--min-amplitude` (default: `0.05`):
-
-- Lower values (e.g., 0.05-0.10): Very sensitive, detects light taps
-- Medium values (e.g., 0.15-0.30): Balanced sensitivity
-- Higher values (e.g., 0.30-0.50): Only strong impacts trigger sounds
-
-The value represents the minimum acceleration amplitude (in g-force) required to trigger a sound.
-
-## Running as a Service
-
-To have spank start automatically at boot, create a launchd plist. Pick your mode:
-
-<details>
-<summary>Pain mode (default)</summary>
+## Building
 
 ```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
-```
+# CLI binary
+go build -o spank .
 
-</details>
+# Menu bar app (dist/spank.app)
+./menubar/build-app.sh 1.0.0
 
-<details>
-<summary>Sexy mode</summary>
-
-```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-        <string>--sexy</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
-```
-
-</details>
-
-<details>
-<summary>Halo mode</summary>
-
-```bash
-sudo tee /Library/LaunchDaemons/com.taigrr.spank.plist > /dev/null << 'EOF'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.taigrr.spank</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/local/bin/spank</string>
-        <string>--halo</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/spank.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/spank.err</string>
-</dict>
-</plist>
-EOF
-```
-
-</details>
-
-> **Note:** Update the path to `spank` if you installed it elsewhere (e.g. `~/go/bin/spank`).
-
-Load and start the service:
-
-```bash
-sudo launchctl load /Library/LaunchDaemons/com.taigrr.spank.plist
-```
-
-Since the plist lives in `/Library/LaunchDaemons` and no `UserName` key is set, launchd runs it as root — no `sudo` needed.
-
-To stop or unload:
-
-```bash
-sudo launchctl unload /Library/LaunchDaemons/com.taigrr.spank.plist
+# Distributable DMGs
+./menubar/build-dmg-gui.sh 1.0.0   # GUI app DMG
+./scripts/build-dmg.sh 1.0.0       # CLI DMG (binary + install.sh)
 ```
 
 ## How it works
 
 1. Reads raw accelerometer data directly via IOKit HID (Apple SPU sensor)
 2. Runs vibration detection (STA/LTA, CUSUM, kurtosis, peak/MAD)
-3. When a significant impact is detected, plays an embedded MP3 response
-4. **Optional volume scaling** (`--volume-scaling`) — light taps play quietly, hard slaps play at full volume
-5. **Optional speed control** (`--speed`) — adjusts playback speed and pitch (0.5 = half speed, 2.0 = double speed)
-6. 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`
-
-## Star History
-
-[![Star History Chart](https://afterglow.watch/svg?repos=taigrr/spank&type=date&legend=top-left)](https://afterglow.watch)
+3. When a significant impact is detected, grades the amplitude and plays the matching embedded MP3
+4. Playback volume follows the system output volume — no in-app volume control
+5. 750ms cooldown between responses to prevent rapid-fire, adjustable with `--cooldown`
 
 ## Credits
 
-Sensor reading and vibration detection ported from [olvvier/apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer).
+- Sensor reading and vibration detection ported from [olvvier/apple-silicon-accelerometer](https://github.com/olvvier/apple-silicon-accelerometer).
+- Upstream project: [taigrr/spank](https://github.com/taigrr/spank).
 
 ## License
 
