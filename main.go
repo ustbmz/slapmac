@@ -88,8 +88,10 @@ var sensorReady = make(chan struct{})
 var sensorErr = make(chan error, 1)
 
 const (
-	// defaultMinAmplitude is the default detection threshold.
-	defaultMinAmplitude = 0.02
+	// defaultMinAmplitude is the default detection threshold. Ambient
+	// vibration (fans, table knocks, footsteps) peaks around 0.019g on a
+	// typical M2 laptop, so this sits ~30% above the measured noise floor.
+	defaultMinAmplitude = 0.025
 
 	// defaultCooldownMs is the default cooldown between audio responses.
 	defaultCooldownMs = 750
@@ -290,11 +292,10 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 		go readStdinCommands()
 	}
 
-	// Greet on lid open: watch the power management log for wake events
-	// whose reason includes "lid" — the signature written when the lid is
-	// opened from sleep. While the lid is shut the Mac usually sleeps;
-	// on wake the poll resumes and sees the new entry, so the greeting
-	// fires shortly after the lid opens.
+	// Greet on lid open: watch the power management log for "LidOpen" wake
+	// events — the signature written when the lid is opened from sleep. While
+	// the lid is shut the Mac usually sleeps; on wake the poll resumes and sees
+	// the new entry, so the greeting fires shortly after the lid opens.
 	go watchLidOpen(ctx, func() {
 		fmt.Println("spank: lid opened")
 		go playAudio(painDir+"/medium.mp3", &speakerInit)
@@ -433,7 +434,7 @@ func resampleForPlayback(source beep.Streamer, fileRate, speakerRate beep.Sample
 
 // watchLidOpen invokes onOpen whenever the laptop lid is opened. It polls
 // `pmset -g log` (readable without special privileges) for new wake entries
-// whose wake reason includes "lid". lastStamp starts at "now" so historical
+// whose signature contains "LidOpen". lastStamp starts at "now" so historical
 // entries never fire; only entries newer than startup count.
 func watchLidOpen(ctx context.Context, onOpen func()) {
 	const stampLen = len("2006-01-02 15:04:05")
@@ -460,7 +461,11 @@ func watchLidOpen(ctx context.Context, onOpen func()) {
 			if stamp <= lastStamp {
 				continue
 			}
-			if strings.Contains(line, "Wake") && strings.Contains(strings.ToLower(line), "lid") {
+			// Match the exact wake signature "LidOpen" (e.g. "due to
+			// EC.LidOpen(E)"). A bare "lid" substring would also match
+			// common words like "valid"/"invalid" in unrelated pmset
+			// lines and fire phantom greetings.
+			if strings.Contains(line, "Wake") && strings.Contains(strings.ToLower(line), "lidopen") {
 				onOpen()
 			}
 		}

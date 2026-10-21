@@ -58,7 +58,7 @@ sudo spank            # graded responses by slap intensity
 sudo spank --fast     # faster polling and shorter cooldown
 sudo spank --debug    # live sensor stats (samples/s, maxMag, events)
 
-# Adjust sensitivity (default: 0.02)
+# Adjust sensitivity (default: 0.025, just above the ambient noise floor)
 sudo spank --min-amplitude 0.05   # ignore very light taps
 
 # Set cooldown period in millisecond (default: 750)
