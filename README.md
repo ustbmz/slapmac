@@ -1,10 +1,6 @@
-<p align="center">
-  <img src="doc/logo.png" alt="slapmac logo" width="200">
-</p>
-
 # slapmac
 
-**English** | [简体中文][readme-zh-link]
+**English** | [简体中文](./README-zh.md)
 
 Slap your MacBook, it yells back — hit harder, hear something worse.
 
@@ -72,8 +68,8 @@ sudo spank --speed 1.5   # faster
 
 ### Intensity-graded responses
 
-No mode switching — the response is chosen automatically by the force of
-each individual slap. Thresholds are calibrated against live M2 sensor data
+No mode switching — the response is chosen automatically by the force of  
+each individual slap. Thresholds are calibrated against live M2 sensor data  
 (ordinary taps register 0.02–0.06g event amplitude, hard slaps reach 0.10g+):
 
 | Slap amplitude | Response     |
@@ -121,6 +117,3 @@ go build -o spank .
 ## License
 
 MIT
-
-<!-- Links -->
-[readme-zh-link]: ./README-zh.md
