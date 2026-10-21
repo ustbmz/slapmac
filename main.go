@@ -17,6 +17,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/exec"
 	"os/signal"
 	"sort"
 	"strings"
@@ -289,6 +290,16 @@ func listenForSlaps(ctx context.Context, accelRing *shm.RingBuffer, tuning runti
 		go readStdinCommands()
 	}
 
+	// Greet on lid open: watch the power management log for wake events
+	// whose reason includes "lid" — the signature written when the lid is
+	// opened from sleep. While the lid is shut the Mac usually sleeps;
+	// on wake the poll resumes and sees the new entry, so the greeting
+	// fires shortly after the lid opens.
+	go watchLidOpen(ctx, func() {
+		fmt.Println("spank: lid opened")
+		go playAudio(painDir+"/medium.mp3", &speakerInit)
+	})
+
 	presetLabel := "default"
 	if fastMode {
 		presetLabel = "fast"
@@ -418,6 +429,43 @@ func resampleForPlayback(source beep.Streamer, fileRate, speakerRate beep.Sample
 		return source
 	}
 	return beep.Resample(4, srcRate, speakerRate, source)
+}
+
+// watchLidOpen invokes onOpen whenever the laptop lid is opened. It polls
+// `pmset -g log` (readable without special privileges) for new wake entries
+// whose wake reason includes "lid". lastStamp starts at "now" so historical
+// entries never fire; only entries newer than startup count.
+func watchLidOpen(ctx context.Context, onOpen func()) {
+	const stampLen = len("2006-01-02 15:04:05")
+	lastStamp := time.Now().Format("2006-01-02 15:04:05")
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
+		out, err := exec.Command("pmset", "-g", "log").Output()
+		if err != nil {
+			continue
+		}
+		maxSeen := lastStamp
+		for _, line := range strings.Split(string(out), "\n") {
+			if len(line) < stampLen {
+				continue
+			}
+			stamp := line[:stampLen]
+			if stamp > maxSeen {
+				maxSeen = stamp
+			}
+			if stamp <= lastStamp {
+				continue
+			}
+			if strings.Contains(line, "Wake") && strings.Contains(strings.ToLower(line), "lid") {
+				onOpen()
+			}
+		}
+		lastStamp = maxSeen
+	}
 }
 
 func playAudio(path string, speakerInit *bool) {
